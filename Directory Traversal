@@ -1,0 +1,363 @@
+# Directory Traversal 
+
+> **Scope:** Expanded learning notes on directory (path) traversal. Covers theory, detection, exploitation patterns for testing, OS differences, encodings and bypass techniques, defensive coding patterns, and testing/reporting tips.  
+> ⚠️ **For educational and defensive purposes only — do not test systems without explicit permission.**
+
+---
+
+## Table of Contents
+
+1. [What is Directory Traversal?](#what-is-directory-traversal)
+2. [Core Concepts](#core-concepts)
+3. [Quick Testing Checklist](#quick-testing-checklist)
+4. [OS Differences and Quirks](#os-differences-and-quirks)
+5. [Encodings and Bypass Techniques](#encodings-and-bypass-techniques)
+6. [Common Bypass Examples](#common-bypass-examples)
+7. [Example Vulnerable Code](#example-vulnerabilities-in-code)
+8. [Secure Coding Patterns](#secure-coding-patterns)
+9. [Advanced Topics](#advanced-topics)
+10. [Detection and Logging](#detection-and-logging)
+11. [Testing Commands](#example-test-commands)
+12. [Reporting & Remediation](#reporting--remediation-checklist)
+13. [References](#helpful-references)
+
+---
+
+## What is Directory Traversal?
+
+**Directory traversal** (also called **path traversal**) is a vulnerability that occurs when an application uses user-supplied input to construct filesystem paths without proper validation, normalization, or canonicalization. An attacker can manipulate the path (e.g., using `..`) to access files and directories outside the intended directory scope.
+
+### Impacts
+- Disclosure of configuration files
+- Source code exposure
+- Credential leakage
+- Access to sensitive system files accessible to the application process
+
+---
+
+## Core Concepts
+
+### Base Directory / Document Root
+The directory the application intends to serve files from (e.g., `/var/www/uploads`). Secure implementations ensure resolved paths never leave this base.
+
+### Canonicalization / Normalization
+Converting a path to a normalized form (resolving `.` and `..`, symbolic links, redundant separators, percent-encoding, case differences) before validation.
+
+### TOCTOU (Time-of-check Time-of-use)
+A check performed on a path can be bypassed if the underlying file system changes between validation and use (race conditions, symlink swaps).
+
+### Privilege Boundaries
+The application process runs with certain permissions; traversal can only read files accessible to that process.
+
+---
+
+## Quick Testing Checklist
+
+*For ethical testing only*
+
+### Step 1: Locate Path-Using Endpoints
+- Look for parameters like `?file=...`, image src, download endpoints
+- Inspect HTML source or intercepted requests
+
+### Step 2: Same-Value Technique
+Test predictable variants and compare responses:
+- `images/photo.jpg` (baseline)
+- `images/./photo.jpg` (same)
+- `images/../photo.jpg` (likely different)
+- `images/../images/photo.jpg` (back to same)
+
+### Step 3: Attempt Traversal Payloads
+Try reading well-known files:
+- **Unix:** `/etc/passwd`, `/etc/hosts`, application config files
+- **Windows:** `C:\Windows\System32\drivers\etc\hosts`, application config locations
+
+### Step 4: Use Multiple Segments
+Use many `..` segments — you don't need exact depth:
+```
+../../../../../../../etc/passwd
+```
+
+### Step 5: Try Variations
+- Test different encodings (see section below)
+- Use `curl` or `wget` for automated retrieval
+
+---
+
+## OS Differences and Quirks
+
+### Unix/Linux
+- Traversal normally requires traversable directories
+- Attempts via non-existent intermediate directories typically fail
+- File ownership and permissions are enforced
+- `/etc/shadow` is typically unreadable by web processes
+- **Symbolic links** can redirect canonicalized paths
+
+### Windows
+- Some implementations accept traversal through non-existent directories
+- Path separators `\` and `/` may both be accepted
+- Drive-relative and UNC paths (`\\server\share`) present different concerns
+- Be mindful of normalization differences
+
+---
+
+## Encodings and Bypass Techniques
+
+Attackers (and testers) will try many encodings to bypass naive filters.
+
+### Common Techniques
+
+#### URL-encoding / Percent-encoding
+```
+%2e%2e%2f → ../
+```
+
+#### Double-encoding
+```
+%252e%252e%252f (server decodes twice)
+```
+
+#### Unicode / UTF-8 Encodings
+- Overlong encodings or encoded `.` and `/` sequences
+- Can bypass poorly implemented filters
+
+#### Null Byte Injection (Historical)
+- Appending `%00` to terminate strings in unsafe C-based APIs
+- Mostly mitigated in modern frameworks/languages
+
+#### Mixed Separators
+```
+..\ vs ../
+.%2f combinations
+```
+
+#### Case Variations
+```
+..%2F..%2Fetc%2Fpasswd
+```
+
+#### Directory Name Fuzzing
+```
+....// or .// variants
+```
+
+> **Defense Note:** Normalization should occur **before** any allow-list/deny-list checks. Always use strong canonicalization functions provided by the platform.
+
+---
+
+## Common Bypass Examples
+
+*For authorized testing and to help defenders create detection rules*
+
+### Payloads to Try
+
+```
+../../../../../../etc/passwd
+..%2f..%2f..%2f..%2fetc%2fpasswd
+%2e%2e/%2e%2e/%2e%2e/%2e%2e/etc/passwd
+..\..\..\..\Windows\System32\drivers\etc\hosts
+..%255c..%255c..%255cwindows%255csystem32%255cdrivers%255cetc%255chosts
+....//....//etc/passwd
+%2e%2e%2f%2e%2e%2fetc%2fpasswd
+```
+
+**Always record response differences:** Some servers return 200 with file contents, others 403/500 or generic errors.
+
+---
+
+## Example Vulnerabilities in Code
+
+### Why It Happens
+
+#### PHP Example (Vulnerable) ❌
+```php
+// BAD: concatenating user input directly
+$file = __DIR__ . '/uploads/' . $_GET['file'];
+echo file_get_contents($file);
+```
+
+#### Node.js Example (Vulnerable) ❌
+```javascript
+// BAD
+const file = path.join(__dirname, 'uploads', req.query.file);
+res.sendFile(file);
+```
+
+If `req.query.file` contains `../../etc/passwd`, without validation the resolved path may escape the uploads directory.
+
+---
+
+## Secure Coding Patterns
+
+### Best Practice: Canonicalization + Validation
+
+Always canonicalize and validate paths against an allow-list (base directory). Prefer high-level safe APIs.
+
+### PHP (Safe Pattern) ✅
+
+```php
+$base = realpath(__DIR__ . '/uploads');
+$path = realpath($base . '/' . $_GET['file']);
+
+if ($path === false || strpos($path, $base) !== 0) {
+  // invalid or traversal attempt
+  http_response_code(400);
+  exit;
+}
+
+echo file_get_contents($path);
+```
+
+### Node.js (Safe Pattern) ✅
+
+```javascript
+const path = require('path');
+const fs = require('fs');
+
+const base = path.resolve(__dirname, 'uploads');
+const requested = path.normalize(req.query.file);
+const full = path.resolve(base, requested);
+
+if (!full.startsWith(base + path.sep)) {
+  res.status(400).send('Invalid path');
+  return;
+}
+
+res.sendFile(full);
+```
+
+### Python Flask (Safe Pattern) ✅
+
+```python
+from pathlib import Path
+
+base = Path(__file__).resolve().parent / 'uploads'
+requested = (base / request.args.get('file')).resolve()
+
+if not str(requested).startswith(str(base)):
+    abort(400)
+    
+return send_file(requested)
+```
+
+### Additional Mitigations
+
+1. **Use an allow-list** of filenames or IDs mapped to filenames instead of accepting raw filenames
+2. **Store files in object storage** (S3) or a database and serve via signed URLs
+3. **Enforce least privilege** for file-accessing processes
+4. **Use Web Application Firewalls (WAF)** with path-traversal rule sets (defense-in-depth, not primary defense)
+
+---
+
+## Advanced Topics
+
+### Symlink / Race Conditions (TOCTOU)
+
+If you check the resolved path and then open the file, an attacker may change a symlink between those operations.
+
+**Mitigation:**
+- Use OS-level safeguards (open with `O_NOFOLLOW` where available)
+- Perform atomic operations
+
+### Zip-slip (Archive Extraction)
+
+When extracting archives, file names inside can contain `../` sequences to overwrite files outside the intended directory.
+
+**Mitigation:**
+- Always validate extracted paths
+- Use safe extraction libraries
+
+### Chroot / Containers
+
+Chrooting or running inside containers reduces the blast radius, but doesn't remove the need for proper validation. Ensure the container or chroot root doesn't include sensitive files.
+
+---
+
+## Detection and Logging
+
+### Logging
+Log the following for suspicious activity detection:
+- Requested file paths (sanitized)
+- Client IPs
+- Timestamps
+- Response codes
+
+### Alerting
+Set alerts for requests containing:
+- `..`
+- `%2e%2e`
+- Null bytes
+- Unusual encodings
+
+### Scanning/Automation
+- Use safe scanners that report potential traversal endpoints
+- Augment with custom scripts that normalize paths and check whether resolved paths escape the base directory
+
+### WAF Signatures
+Add rules for common encoded traversal patterns, but treat WAF as defense-in-depth.
+
+---
+
+## Example Test Commands
+
+⚠️ **Authorized testing only**
+
+### Simple curl Request
+
+```bash
+curl -s "https://target.example.com/download?file=../../../../etc/passwd"
+```
+
+### Encoded Payloads
+
+```bash
+curl -s "https://target.example.com/download?file=..%2f..%2f..%2f..%2fetc%2fpasswd"
+```
+
+**Record:** HTTP status codes and response bodies
+
+---
+
+## Reporting & Remediation Checklist
+
+### When You Find a Traversal Issue
+
+Your report should include:
+
+1. **Impact summary** - What files/data were accessible
+2. **Proof of concept** (sanitized) showing the payload and response
+3. **Steps to reproduce** (clear, minimal)
+4. **Suggested remediation** (canonicalization, allow-listing, permissions)
+5. **Risk rating** (e.g., CVSS vector if relevant)
+6. **Evidence** - Screenshots / curl outputs
+
+### Remediation Actions
+
+1. **Immediately rotate** any exposed secrets
+2. **Patch the code** to canonicalize and validate paths
+3. **Restrict** file-access service account privileges
+4. **Deploy WAF rules** to block encoded traversal attempts while a patch is prepared
+
+---
+
+## Helpful References
+
+- **OWASP:** Path Traversal guidance and cheat sheets
+- **Language/platform docs:**
+  - PHP: `realpath`
+  - Node.js: `path.resolve`
+  - Python: `Path.resolve`
+- **Archive extraction best practices** (preventing Zip-slip)
+
+---
+
+## Summary
+
+Directory traversal is a critical, well-understood issue with many possible bypasses. The robust defense is:
+
+**Canonicalization + Validation + Least Privilege**
+
+Use multiple layers of protection (secure code, configuration, and detection) to reduce risk.
+
+---
+
+*End of deep dive*
